@@ -21,31 +21,46 @@
 package org.apache.spark.sql.execution.datasources.hbase
 
 import java.io._
+import java.security.PrivilegedAction
+import java.util
+import java.util.UUID
 
+import scala.collection.JavaConverters._
 import scala.util.control.NonFatal
 import scala.xml.XML
-import org.json4s.DefaultFormats
-import org.json4s.jackson.JsonMethods._
+
+import org.apache.spark.SparkConf
+import org.apache.spark.internal.config.{KEYTAB, PRINCIPAL}
+import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.{DataFrame, Row, SaveMode, SQLContext}
+import org.apache.spark.sql.execution.datasources.hbase.types.{SHCDataType, SHCDataTypeFactory}
+import org.apache.spark.sql.execution.streaming.Sink
+import org.apache.spark.sql.sources._
+import org.apache.spark.sql.streaming.OutputMode
+import org.apache.spark.sql.types._
+import org.apache.spark.util.Utils
+
+import org.apache.commons.io.IOUtils
+import org.apache.commons.lang3.StringUtils
 import org.apache.hadoop.conf.Configuration
+import org.apache.hadoop.fs.{FileSystem, FsShell, Path}
+import org.apache.hadoop.hbase._
 import org.apache.hadoop.hbase.client.Put
 import org.apache.hadoop.hbase.io.ImmutableBytesWritable
-import org.apache.hadoop.hbase.mapreduce.TableOutputFormat
+import org.apache.hadoop.hbase.mapreduce.{HFileOutputFormat2, LoadIncrementalHFiles, TableOutputFormat}
 import org.apache.hadoop.hbase.util.Bytes
-import org.apache.hadoop.hbase._
 import org.apache.hadoop.mapreduce.Job
-import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.sources._
-import org.apache.spark.sql.types._
-import org.apache.spark.sql.{DataFrame, Row, SQLContext, SaveMode}
-import org.apache.spark.sql.execution.datasources.hbase.types.{SHCDataType, SHCDataTypeFactory}
-import org.apache.spark.util.Utils
+import org.apache.hadoop.security.UserGroupInformation
+import org.json4s.DefaultFormats
+import org.json4s.jackson.JsonMethods._
 
 /**
  * val people = sqlContext.read.format("hbase").load("people")
  */
-private[sql] class DefaultSource extends RelationProvider with CreatableRelationProvider {//with DataSourceRegister {
+private[sql] class DefaultSource extends 
+  StreamSinkProvider with RelationProvider with CreatableRelationProvider with DataSourceRegister {
 
-  //override def shortName(): String = "hbase"
+  override def shortName(): String = "hbase"
 
   override def createRelation(
       sqlContext: SQLContext,
@@ -63,6 +78,12 @@ private[sql] class DefaultSource extends RelationProvider with CreatableRelation
     relation.insert(data, false)
     relation
   }
+
+  override def createSink(
+    sqlContext: SQLContext,
+    parameters: Map[String, String],
+    partitionColumns: Seq[String],
+    outputMode: OutputMode): Sink = new HBaseSink(sqlContext, parameters)
 }
 
 case class InvalidRegionNumberException(message: String = "", cause: Throwable = null)
@@ -81,7 +102,7 @@ case class HBaseRelation(
   val mergeToLatest = parameters.get(HBaseRelation.MERGE_TO_LATEST).map(_.toBoolean).getOrElse(true)
   val restrictive = parameters.getOrElse(HBaseRelation.RESTRICTIVE, HBaseRelation.Restrictive.column)
 
-  val catalog = HBaseTableCatalog(parameters)
+  val catalog = HBaseTableCatalog(parameters, userSpecifiedschema)
 
   private val wrappedConf = {
     implicit val formats = DefaultFormats
@@ -117,13 +138,16 @@ case class HBaseRelation(
     new SerializableConfiguration(hConf)
   }
 
-  def hbaseConf = wrappedConf.value
+  val hfileTempPath = parameters.get(HBaseRelation.HFILE_TEMP_PATH)
+  val writeMode = parameters.get(HBaseRelation.WRITE_MODE)
+
+  def hbaseConf: Configuration = wrappedConf.value
 
   val serializedToken = SHCCredentialsManager.manager.getTokenForCluster(hbaseConf)
 
   def createTableIfNotExist() {
     val cfs = catalog.getColumnFamilies
-    val connection = HBaseConnectionCache.getConnection(hbaseConf)
+    val connection = doAs(HBaseConnectionCache.getConnection(hbaseConf))
     // Initialize hBase table if necessary
     val admin = connection.getAdmin
     val isNameSpaceExist = try {
@@ -138,7 +162,7 @@ case class HBaseRelation(
     if (!isNameSpaceExist) {
       admin.createNamespace(NamespaceDescriptor.create(catalog.namespace).build)
     }
-    val tName = TableName.valueOf(s"${catalog.namespace}:${catalog.name}")
+    val tName = TableName.valueOf(catalog.namespace, catalog.name)
     // The names of tables which are created by the Examples has prefix "shcExample"
     if (admin.isTableAvailable(tName)
       && tName.toString.startsWith(s"${catalog.namespace}:shcExample")){
@@ -180,6 +204,96 @@ case class HBaseRelation(
    * @param overwrite Overwrite existing values
    */
   override def insert(data: DataFrame, overwrite: Boolean): Unit = {
+    val mode: String = writeMode.getOrElse(HBaseRelation.Restrictive.PUT)
+    mode match {
+      case HBaseRelation.Restrictive.PUT => put(data)
+      case HBaseRelation.Restrictive.BULKLOAD => bulkload(data)
+      case _ =>
+        throw new IllegalStateException(
+          s"This writing method `$mode` is not supported or recognized"
+        )
+    }
+  }
+
+  private def doAs[T](suppler: => T): T = {
+    val conf: SparkConf = sqlContext.sparkContext.conf
+    val deployMode: String = conf.get("spark.submit.deployMode", null)
+    if ("cluster".equals(deployMode)) {
+      val principal: String = conf.get(PRINCIPAL).orNull
+      val keytab: String = conf.get(KEYTAB).orNull
+      if (StringUtils.isNoneEmpty(principal)) 
+        UserGroupInformation.loginUserFromKeytabAndReturnUGI(principal, keytab).doAs(
+            new PrivilegedAction[T] {override def run(): T = suppler})
+      else suppler
+    } else {
+      suppler
+    }
+  }
+
+  /** bulkload to hbase */
+  def bulkload(data: DataFrame): Unit = {
+    hbaseConf.set(TableOutputFormat.OUTPUT_TABLE, s"${catalog.namespace}:${catalog.name}")
+    val fileSystem = FileSystem.get(hbaseConf)
+    val shell = new FsShell(fileSystem.getConf)
+
+    val hbaseConn = doAs(HBaseConnectionCache.getConnection(hbaseConf))
+    val admin = hbaseConn.getAdmin
+    val table = hbaseConn.getTable(TableName.valueOf(catalog.namespace, catalog.name))
+    doAs {
+      val job = Job.getInstance(hbaseConf)
+      job.setMapOutputKeyClass(classOf[ImmutableBytesWritable])
+      job.setMapOutputValueClass(classOf[KeyValue])
+      HFileOutputFormat2.configureIncrementalLoadMap(job, table.getDescriptor)
+      job
+    }
+
+    val tName: TableName = TableName.valueOf(catalog.namespace, catalog.name)
+    val regionLocator = hbaseConn.getRegionLocator(tName)
+    val allRegionLocations: util.List[HRegionLocation] = regionLocator.getAllRegionLocations
+
+    val rFetcher = (cell: Cell) => {
+      val b = cell.getRowArray
+      val o = KeyValue.ROW_OFFSET
+      val rowlength: Int = Bytes.toShort(b, o)
+      new ImmutableBytesWritable(b, o + Bytes.SIZEOF_SHORT, rowlength)
+    }
+
+    try {
+      val path: String = hfileTempPath.getOrElse(new IllegalStateException("When you output " +
+        "dataframe to HBase in bulk load mode, you must specify the temporary directory" +
+        s" `${HBaseRelation.HFILE_TEMP_PATH}` where hfile is stored")) + "/" + UUID.randomUUID()
+      data.rdd
+        .mapPartitions(iter => {
+          SHCCredentialsManager.processShcToken(serializedToken)
+          iter.flatMap(convertToKeyValue(catalog.getRowKey))})
+        .repartitionAndSortWithinPartitions(
+          new HRegionPartitioner(allRegionLocations.asScala.map(_.getRegionInfo.getStartKey).toList))
+        .map(kv => (rFetcher(kv._2), kv._2))
+        .saveAsNewAPIHadoopFile(
+          path,
+          classOf[ImmutableBytesWritable],
+          classOf[KeyValue],
+          classOf[HFileOutputFormat2],
+          hbaseConf)
+
+      // todo maybe here can use a thread pool?
+      val hfilePath = new Path(path)
+      shell.run(Array("-chmod", "-R", "777", path))
+
+      val bulkLoader = new LoadIncrementalHFiles(hbaseConf)
+      bulkLoader.doBulkLoad(hfilePath, admin, table, regionLocator)
+
+      fileSystem.delete(hfilePath, true)
+    } finally {
+      IOUtils.closeQuietly(admin)
+      IOUtils.closeQuietly(hbaseConn)
+      shell.close()
+      // IOUtils.closeQuietly(fileSystem)
+    }
+  }
+
+  /** put to hbase */
+  def put(data: DataFrame): Unit = {
     hbaseConf.set(TableOutputFormat.OUTPUT_TABLE, s"${catalog.namespace}:${catalog.name}")
     val job = Job.getInstance(hbaseConf)
     job.setOutputFormatClass(classOf[TableOutputFormat[String]])
@@ -199,7 +313,55 @@ case class HBaseRelation(
     }).saveAsNewAPIHadoopDataset(jobConfig)
   }
 
-  private def convertToPut(rkFields: Seq[Field] )(row: Row): (ImmutableBytesWritable, Put) = {
+  /**
+   * convert for bulkload
+   */
+  private def convertToKeyValue(
+                                 rkFields: Seq[Field]
+                               )(row: Row): Iterable[(String, KeyValue)] = {
+
+    val rfqFetcher = (cell: Cell) => {
+      val b = cell.getRowArray
+      if (b.isEmpty) ""
+      else {
+        val o = KeyValue.ROW_OFFSET
+        val l = Bytes.toInt(b, 0)
+        val rowlength: Int = Bytes.toShort(b, o)
+        val row: String = Bytes.toStringBinary(b, o + Bytes.SIZEOF_SHORT, rowlength)
+        val columnoffset: Int = o + Bytes.SIZEOF_SHORT + 1 + rowlength
+        val familylength: Int = b(columnoffset - 1)
+        val columnlength: Int = l - ((columnoffset - o) + KeyValue.TIMESTAMP_TYPE_SIZE)
+        val family: String =
+          if (familylength == 0) ""
+          else Bytes.toStringBinary(b, columnoffset, familylength)
+        val qualifier: String =
+          if (columnlength == 0) ""
+          else
+            Bytes.toStringBinary(
+              b,
+              columnoffset + familylength,
+              columnlength - familylength
+            )
+        row + "/" + family + "/" + qualifier
+      }
+    }
+
+    val (_, put) = convertToPut(rkFields)(row)
+    import scala.collection.JavaConverters._
+    val cells: Iterable[KeyValue] = put.getFamilyCellMap
+      .values()
+      .asScala
+      .flatten(_.asScala)
+      .map(_.asInstanceOf[KeyValue])
+    cells.map(c => {
+      (rfqFetcher(c), c)
+    })
+  }
+
+  /**
+   * convert for put
+   */
+  private def convertToPut(rkFields: Seq[Field])(row: Row): (ImmutableBytesWritable, Put) = {
     val rkIdxedFields = rkFields.map{ case x =>
       (schema.fieldIndex(x.colName), x)
     }
@@ -263,7 +425,7 @@ case class HBaseRelation(
           addColumn(field.col, row(index))
       }
     }
-    (new ImmutableBytesWritable, put)
+    (new ImmutableBytesWritable(rBytes), put)
   }
 
   def rows = catalog.row
@@ -349,6 +511,9 @@ object HBaseRelation {
     val none = "NONE"
     val family = "FAMILY"
     val column = "COLUMN"
+
+    val PUT = "PUT"
+    val BULKLOAD = "BULKLOAD"
   }
 
   val RESTRICTIVE = "restrictive"
@@ -360,4 +525,7 @@ object HBaseRelation {
   val HBASE_CONFIGURATION = "hbaseConfiguration"
   // HBase configuration file such as HBase-site.xml, core-site.xml
   val HBASE_CONFIGFILE = "hbaseConfigFile"
+
+  val WRITE_MODE = "writeMode"
+  val HFILE_TEMP_PATH = "hfileTempPath"
 }

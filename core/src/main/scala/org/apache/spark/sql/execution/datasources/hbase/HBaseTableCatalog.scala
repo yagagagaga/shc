@@ -253,6 +253,40 @@ object HBaseTableCatalog {
   val cVersion = "version"
   val minTableSplitPoint = "minTableSplitPoint"
   val maxTableSplitPoint = "maxTableSplitPoint"
+
+  def apply(parameters: Map[String, String], schema: Option[StructType]): HBaseTableCatalog = {
+    if (parameters.contains(tableCatalog) || schema.isEmpty) {
+      HBaseTableCatalog(parameters)
+    } else {
+      val nSpace: String = parameters.getOrElse(nameSpace, "default")
+      val tName: String =
+        parameters.getOrElse(tableName,
+          throw new IllegalStateException("When you output dataframe to HBase, " +
+            s"you must specify `$tableName`"))
+      val rKey: String =
+        parameters.getOrElse(rowKey,
+          throw new IllegalStateException(
+            "When you output dataframe to HBase, you must specify the field name corresponding " +
+              s"to `$rowKey`"))
+      val tCoder: String = "PrimitiveType"
+      val numReg: Int = parameters.get(newTable).map(x => x.toInt).getOrElse(0)
+      val schemaMap = mutable.LinkedHashMap.empty[String, Field] ++= schema.get.fields
+        .map(sf => {
+          if (sf.name.equals(rKey)) {
+            (sf.name, Field(sf.name, rowKey, sf.name, tCoder, Some(sf.dataType.typeName), None))
+          } else {
+            val columnFamily: String = parameters.getOrElse(cf, 
+              throw new IllegalStateException("When you output dataframe to HBase, you must specify " +
+                s"the value of column family `$cf`"))
+            (sf.name, Field(sf.name, columnFamily, sf.name, tCoder, Some(sf.dataType.typeName), None))
+          }}).toMap
+
+      new HBaseTableCatalog(nSpace, tName, RowKey(rKey), SchemaMap(schemaMap), tCoder, 
+        Set(tCoder), numReg, ("aaaaaa", "zzzzzz")
+      )
+    }
+  }
+
   /**
    * User provide table schema definition
    * {"tablename":"name", "rowkey":"key1:key2",

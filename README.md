@@ -6,6 +6,31 @@ The [Apache Spark](https://spark.apache.org/) - [Apache HBase](https://hbase.apa
 
 With the DataFrame and DataSet support, the library leverages all the optimization techniques in catalyst, and achieves data locality, partition pruning, predicate pushdown, Scanning and BulkGet, etc.
 
+## Change Log
+This version based on [hortonworks SHC](https://github.com/hortonworks-spark/shc). You can store the DataFrame into HBase by using bulkload. This is an example:
+
+    df.write
+      .format("hbase")
+      .option(HBaseTableCatalog.tableName, "test_table")
+      .option(HBaseTableCatalog.rowKey, "rk")
+      .option(HBaseTableCatalog.cf, "f")
+      .option(HBaseRelation.WRITE_MODE, HBaseRelation.Restrictive.BULKLOAD)
+      .option(HBaseRelation.HFILE_TEMP_PATH, "hdfs:///tmp/hfile")
+      .save()
+    // structured-streaing is also suported
+    df.writeStream
+      .format("hbase")
+      .option("checkpointLocation", "hdfs:///tmp/structured-streaming-checkpoint/")
+      .option(HBaseTableCatalog.tableName, "test_table")
+      .option(HBaseTableCatalog.rowKey, "rk")
+      .option(HBaseTableCatalog.cf, "f")
+      .option(HBaseRelation.WRITE_MODE, HBaseRelation.Restrictive.BULKLOAD)
+      .option(HBaseRelation.HFILE_TEMP_PATH, "hdfs:///zmk/hfile")
+      .outputMode(OutputMode.Append())
+      .trigger(Trigger.ProcessingTime(Seconds(10).milliseconds))
+      .start()
+      .awaitTermination()
+
 ## Catalog
 For each table, a catalog has to be provided,  which includes the row key, and the columns with data type with predefined column families, and defines the mapping between hbase column and table schema. The catalog is user defined json format.
 
